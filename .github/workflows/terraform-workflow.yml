@@ -1,0 +1,146 @@
+name: 'Terraform Workflow'
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    name: 'Terraform'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./infra
+    environment: ${{ github.event_name == 'push' && 'production' || '' }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    # Setup comum
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: '1.5.0'
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    # Etapas que rodavam apenas para PR
+    - name: Setup TFLint
+      if: github.event_name == 'pull_request'
+      uses: terraform-linters/setup-tflint@v3
+      with:
+        tflint_version: latest
+
+    - name: Terraform Format
+      if: github.event_name == 'pull_request'
+      id: fmt
+      run: terraform fmt -check -recursive
+      continue-on-error: true
+
+    - name: Run TFLint
+      if: github.event_name == 'pull_request'
+      run: |
+        tflint --init
+        tflint --recursive --format=compact
+
+    # Security Checks para PR
+    - name: TFSec Security Scan
+      if: github.event_name == 'pull_request'
+      uses: aquasecurity/tfsec-action@v1.0.0
+      with:
+        working_directory: ./infra
+
+    - name: Checkov Security Scan
+      if: github.event_name == 'pull_request'
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: ./infra
+        framework: terraform
+
+    # Configuração AWS (para plan e apply)
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: us-east-1
+
+    # Terraform Init - comum para todas as operações
+    - name: Terraform Init
+      id: init
+      run: ${{ github.event_name == 'pull_request' && 'terraform init -backend=false' || 'terraform init' }}
+
+    # Terraform Validate - apenas para PR
+    - name: Terraform Validate
+      if: github.event_name == 'pull_request'
+      id: validate
+      run: terraform validate
+
+    # Terraform Plan - para todos os eventos
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -no-color -out=tfplan
+      continue-on-error: ${{ github.event_name == 'pull_request' }}
+
+    # Exibir plano e salvá-lo como artefato
+    - name: Terraform Show
+      if: always()
+      id: show
+      run: terraform show -no-color tfplan > plan.txt
+
+    - name: Upload Plan as Artifact
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: terraform-plan
+        path: ./infra/plan.txt
+        retention-days: ${{ github.event_name == 'push' && 90 || 5 }}
+
+    # Adicionar comentário do plano no PR
+    - name: Add Plan to PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const plan = fs.readFileSync('./infra/plan.txt', 'utf8');
+          const MAX_COMMENT_SIZE = 65536;
+          let planSummary = plan.length > MAX_COMMENT_SIZE 
+            ? plan.substring(0, MAX_COMMENT_SIZE) + '\n\n... (Output truncated, see attached plan artifact for complete plan)'
+            : plan;
+          
+          const comment = `## Terraform Plan 📝\n
+          \`\`\`terraform\n
+          ${planSummary}
+          \`\`\`\n
+          *Pusher: @${context.payload.pull_request.user.login}, Action: ${context.eventName}*`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          })
+
+    # Terraform Apply - apenas para push na main ou workflow_dispatch
+    - name: Terraform Apply
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      id: apply
+      run: terraform apply -auto-approve tfplan
+
+    # Salvar output - apenas quando houver apply
+    - name: Terraform Output
+      if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && success()
+      id: output
+      run: terraform output -json > tf-output.json
+
+    - name: Upload Terraform Output
+      if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && success()
+      uses: actions/upload-artifact@v3
+      with:
+        name: terraform-output
+        path: ./infra/tf-output.json
+        retention-days: 90

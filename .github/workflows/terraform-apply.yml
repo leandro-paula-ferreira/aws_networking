@@ -1,0 +1,128 @@
+name: 'Aplicação do Terraform'
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      version_increment:
+        description: 'Tipo de incremento de versão (patch, minor, major)'
+        required: true
+        default: 'patch'
+        type: choice
+        options: 
+          - patch
+          - minor
+          - major
+
+jobs:
+  version:
+    name: 'Versionamento Semântico'
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.semver.outputs.new_version }}
+      committer: ${{ steps.get-committer.outputs.committer }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Obter Informações do Committer
+        id: get-committer
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            COMMITTER=$(git log -1 --pretty=format:'%an <%ae>')
+          else
+            COMMITTER="${{ github.actor }} (workflow_dispatch)"
+          fi
+          echo "committer=${COMMITTER}" >> $GITHUB_OUTPUT
+      
+      - name: Gerar Nova Versão Semântica
+        id: semver
+        uses: anothrNick/github-tag-action@1.64.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WITH_V: true
+          DEFAULT_BUMP: ${{ github.event.inputs.version_increment || 'patch' }}
+          RELEASE_BRANCHES: main
+    
+  terraform:
+    name: 'Aplicação do Terraform'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./infra
+    environment: production
+    needs: version
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    # Configuração
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: '1.5.0'
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    # Configuração da AWS
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        aws-region: us-east-1
+
+    # Execução do Terraform
+    - name: Terraform Init
+      id: init
+      run: terraform init
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        # Adicionar informações de versão e committer como variáveis
+        cat > version.auto.tfvars.json << EOF
+        {
+          "app_version": "${{ needs.version.outputs.new_version }}",
+          "last_deployed_by": "${{ needs.version.outputs.committer }}"
+        }
+        EOF
+        
+        terraform plan -no-color -out=tfplan -var="app_version=${{ needs.version.outputs.new_version }}" -var="last_deployed_by=${{ needs.version.outputs.committer }}"
+
+    # Salvar plano como artefato
+    - name: Terraform Show
+      id: show
+      run: terraform show -no-color tfplan > plan.txt
+
+    - name: Upload Plan as Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: terraform-plan
+        path: ./infra/plan.txt
+        retention-days: 90
+
+    # Aplicar mudanças
+    - name: Terraform Apply
+      id: apply
+      run: terraform apply -auto-approve tfplan
+
+    # Salvar saída
+    - name: Terraform Output
+      if: success()
+      id: output
+      run: |
+        terraform output -json > tf-output.json
+        echo "Versão: ${{ needs.version.outputs.new_version }}" >> tf-output.json
+        echo "Implantado por: ${{ needs.version.outputs.committer }}" >> tf-output.json
+
+    - name: Upload Terraform Output
+      if: success()
+      uses: actions/upload-artifact@v3
+      with:
+        name: terraform-output
+        path: ./infra/tf-output.json
+        retention-days: 90
